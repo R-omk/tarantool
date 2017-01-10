@@ -3392,52 +3392,37 @@ out:
  */
 static int
 vy_range_set(struct vy_range *range, const struct vy_stmt *stmt,
-	     int64_t alloc_id)
+	     int64_t alloc_lsn)
 {
 	struct vy_index *index = range->index;
 	struct vy_scheduler *scheduler = index->env->scheduler;
-
-	const struct vy_stmt *replaced_stmt = NULL;
 	struct vy_mem *mem = range->mem;
-	size_t size = vy_stmt_size(stmt);
-	struct vy_stmt *mem_stmt;
-	mem_stmt = lsregion_alloc(&index->env->allocator, size, alloc_id);
-	if (mem_stmt == NULL) {
-		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
-		return -1;
-	}
-	memcpy(mem_stmt, stmt, size);
-	/*
-	 * Region allocated statements can't be referenced or unreferenced
-	 * because they are located in monolithic memory region. Referencing has
-	 * sense only for separately allocated memory blocks.
-	 * The reference count here is set to 0 for an assertion if somebody
-	 * will try to unreference this statement.
-	 */
-	mem_stmt->refs = 0;
 
-	int rc = vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt);
+	if (mem->min_lsn >= stmt->lsn) {
+		say_warn("OPS: %lld %lld", mem->min_lsn, stmt->lsn);
+	}
+
+	bool was_empty = (mem->used == 0);
+
+	int rc = vy_mem_insert(mem, stmt, alloc_lsn);
 	if (rc != 0)
 		return -1;
 
-	if (mem->used == 0) {
-		mem->min_lsn = mem_stmt->lsn;
+	if (was_empty)
 		vy_scheduler_mem_dirtied(scheduler, mem);
-	}
+
 	if (range->used == 0) {
-		range->min_lsn = mem_stmt->lsn;
+		range->min_lsn = stmt->lsn;
 		vy_scheduler_update_range(scheduler, range);
 	}
 
-	assert(mem->min_lsn <= mem_stmt->lsn);
-	assert(range->min_lsn <= mem_stmt->lsn);
+	assert(mem->min_lsn <= stmt->lsn);
+	assert(range->min_lsn <= stmt->lsn);
 
-	mem->used += size;
+	size_t size = vy_stmt_size(stmt);
 	range->used += size;
 	index->used += size;
 	index->stmt_count++;
-
-	mem->version++;
 
 	return 0;
 }

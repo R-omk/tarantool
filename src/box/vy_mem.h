@@ -143,6 +143,19 @@ void
 vy_mem_delete(struct vy_mem *index);
 
 /**
+ * Insert a statement into the tree.
+ *
+ * @param mem vy_mem
+ * @param stmt statement
+ * @param alloc_lsn LSN for lsregion allocator
+ * @retval 0 on success
+ * @retval -1 on error, check diag
+ */
+int
+vy_mem_insert(struct vy_mem *mem, const struct vy_stmt *stmt,
+	      int64_t alloc_lsn);
+
+/**
  * Return the older statement for the given key.
  *
  * @param mem vy_mem

@@ -113,6 +113,42 @@ vy_mem_delete(struct vy_mem *index)
 	free(index);
 }
 
+int
+vy_mem_insert(struct vy_mem *mem, const struct vy_stmt *stmt,
+	      int64_t alloc_lsn)
+{
+	size_t size = vy_stmt_size(stmt);
+	struct vy_stmt *mem_stmt;
+	mem_stmt = lsregion_alloc(mem->allocator, size, alloc_lsn);
+	if (mem_stmt == NULL) {
+		diag_set(OutOfMemory, size, "lsregion_alloc", "mem_stmt");
+		return -1;
+	}
+	memcpy(mem_stmt, stmt, size);
+	/*
+	 * Region allocated statements can't be referenced or unreferenced
+	 * because they are located in monolithic memory region. Referencing has
+	 * sense only for separately allocated memory blocks.
+	 * The reference count here is set to 0 for an assertion if somebody
+	 * will try to unreference this statement.
+	 */
+	mem_stmt->refs = 0;
+
+	const struct vy_stmt *replaced_stmt = NULL;
+	int rc = vy_mem_tree_insert(&mem->tree, mem_stmt, &replaced_stmt);
+	if (rc != 0)
+		return -1;
+
+	if (mem->used == 0)
+		mem->min_lsn = mem_stmt->lsn;
+	assert(mem->min_lsn <= stmt->lsn);
+
+	mem->used += size;
+	mem->version++;
+
+	return 0;
+}
+
 /*
  * Return the older statement for the given one.
  */
