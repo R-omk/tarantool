@@ -355,6 +355,7 @@ vy_mem_tree_cmp_key(const struct vy_stmt *a, struct tree_mem_key *key,
 #define bps_tree_key_t struct tree_mem_key *
 #define bps_tree_arg_t struct vy_mem *
 #define BPS_TREE_NO_DEBUG
+#define BPS_TREE_SOURCE 1
 
 #include "salad/bps_tree.h"
 
