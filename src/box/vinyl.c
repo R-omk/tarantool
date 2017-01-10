@@ -391,6 +391,10 @@ struct vy_mem {
 	struct tuple_format *format;
 	/** version is initially 0 and is incremented on every write */
 	uint32_t version;
+	/** Allocator for extents */
+	struct lsregion *allocator;
+	/** The last LSN for lsregion allocator */
+	const int64_t *allocator_lsn;
 };
 
 static int
@@ -427,8 +431,8 @@ vy_mem_tree_extent_free(void *ctx, void *p)
 }
 
 static struct vy_mem *
-vy_mem_new(struct vy_env *env, struct key_def *key_def,
-	   struct tuple_format *format)
+vy_mem_new(struct key_def *key_def, struct tuple_format *format,
+	   struct lsregion *allocator, const int64_t *allocator_lsn)
 {
 	struct vy_mem *index = malloc(sizeof(*index));
 	if (!index) {
@@ -441,8 +445,10 @@ vy_mem_new(struct vy_env *env, struct key_def *key_def,
 	index->key_def = key_def;
 	index->version = 0;
 	index->format = format;
+	index->allocator = allocator;
+	index->allocator_lsn = allocator_lsn;
 	vy_mem_tree_create(&index->tree, index, vy_mem_tree_extent_alloc,
-			   vy_mem_tree_extent_free, env);
+			   vy_mem_tree_extent_free, index);
 	rlist_create(&index->in_frozen);
 	rlist_create(&index->in_dirty);
 	return index;
@@ -1180,9 +1186,10 @@ struct tx_manager {
 static void *
 vy_mem_tree_extent_alloc(void *ctx)
 {
-	struct vy_env *env = (struct vy_env *) ctx;
-	void *ret = lsregion_alloc(&env->allocator, VY_MEM_TREE_EXTENT_SIZE,
-				   env->xm->lsn);
+	struct vy_mem *mem = (struct vy_mem *) ctx;
+	assert(mem->allocator != NULL && mem->allocator_lsn != NULL);
+	void *ret = lsregion_alloc(mem->allocator, VY_MEM_TREE_EXTENT_SIZE,
+				   *mem->allocator_lsn);
 	if (ret == NULL)
 		diag_set(OutOfMemory, VY_MEM_TREE_EXTENT_SIZE, "lsregion_alloc",
 			 "ret");
@@ -3284,6 +3291,10 @@ vy_range_discard_compact_parts(struct vy_range *range)
 static int
 vy_index_create(struct vy_index *index)
 {
+	struct vy_scheduler *scheduler = index->env->scheduler;
+	struct tx_manager *xm = index->env->xm;
+	struct lsregion *allocator = &index->env->allocator;
+
 	/* create directory */
 	int rc;
 	char *path_sep = index->path;
@@ -3318,9 +3329,10 @@ vy_index_create(struct vy_index *index)
 		return -1;
 	vy_index_add_range(index, range);
 	vy_index_acct_range(index, range);
-	vy_scheduler_add_range(index->env->scheduler, range);
+	vy_scheduler_add_range(scheduler, range);
 	/* create initial mem */
-	range->mem = vy_mem_new(index->env, index->key_def, index->format);
+	range->mem = vy_mem_new(index->key_def, index->format,
+				allocator, &xm->lsn);
 	if (range->mem == NULL)
 		return -1;
 	return 0;
@@ -3461,6 +3473,10 @@ fail:
 static int
 vy_index_open_ex(struct vy_index *index)
 {
+	struct vy_scheduler *scheduler = index->env->scheduler;
+	struct lsregion *allocator = &index->env->allocator;
+	struct tx_manager *xm = index->env->xm;
+
 	struct vy_run_desc *desc;
 	int count;
 	int rc = -1;
@@ -3523,9 +3539,9 @@ vy_index_open_ex(struct vy_index *index)
 							   index->key_def)))
 			break;
 		vy_index_acct_range(index, range);
-		vy_scheduler_add_range(index->env->scheduler, range);
-		range->mem = vy_mem_new(index->env, index->key_def,
-					index->format);
+		vy_scheduler_add_range(scheduler, range);
+		range->mem = vy_mem_new(index->key_def, index->format,
+					allocator, &xm->lsn);
 		if (range->mem == NULL)
 			goto out;
 	}
@@ -3933,7 +3949,10 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 		.complete = vy_task_dump_complete,
 		.abort = vy_task_dump_abort,
 	};
+
 	struct vy_index *index = range->index;
+	struct tx_manager *xm = index->env->xm;
+	struct lsregion *allocator = &index->env->allocator;
 
 	struct vy_task *task = vy_task_new(pool, index, &dump_ops);
 	if (task == NULL)
@@ -3941,7 +3960,7 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 
 	struct vy_write_iterator *wi;
 	wi = vy_write_iterator_new(index, range->run_count == 0,
-				   tx_manager_vlsn(index->env->xm));
+				   tx_manager_vlsn(xm));
 	if (wi == NULL)
 		goto err_wi;
 
@@ -3966,7 +3985,8 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range)
 	if (range->mem->used == 0)
 		goto done;
 
-	mem = vy_mem_new(index->env, index->key_def, index->format);
+	mem = vy_mem_new(index->key_def, index->format,
+			 allocator, &xm->lsn);
 	if (mem == NULL)
 		goto err_mem;
 
@@ -4080,6 +4100,10 @@ vy_task_compact_abort(struct vy_task *task, bool in_shutdown)
 static struct vy_task *
 vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 {
+	struct vy_index *index = range->index;
+	struct lsregion *allocator = &index->env->allocator;
+	struct tx_manager *xm = index->env->xm;
+
 	assert(rlist_empty(&range->compact_list));
 
 	static struct vy_task_ops compact_ops = {
@@ -4088,7 +4112,6 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		.abort = vy_task_compact_abort,
 	};
 
-	struct vy_index *index = range->index;
 	struct vy_stmt *split_key = NULL;
 	const char *split_key_raw;
 	struct vy_range *parts[2] = {NULL, };
@@ -4100,8 +4123,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		goto err_task;
 
 	struct vy_write_iterator *wi;
-	wi = vy_write_iterator_new(index, true,
-				   tx_manager_vlsn(index->env->xm));
+	wi = vy_write_iterator_new(index, true, tx_manager_vlsn(xm));
 	if (wi == NULL)
 		goto err_wi;
 
@@ -4145,7 +4167,8 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		r->new_run = vy_run_new();
 		if (r->new_run == NULL)
 			goto err_parts;
-		r->mem = vy_mem_new(index->env, index->key_def, index->format);
+		r->mem = vy_mem_new(index->key_def, index->format,
+				    allocator, &xm->lsn);
 		if (r->mem == NULL)
 			goto err_parts;
 		/* Account merge w/o split. */
