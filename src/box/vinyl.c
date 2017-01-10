@@ -4613,22 +4613,19 @@ vy_scheduler_start_workers(struct vy_scheduler *scheduler)
 static void
 vy_scheduler_stop_workers(struct vy_scheduler *scheduler)
 {
+	struct stailq task_queue;
+	stailq_create(&task_queue);
+
 	assert(scheduler->is_worker_pool_running);
 	scheduler->is_worker_pool_running = false;
 
-	/* Abort all pending tasks and wake up worker threads */
+	/* Clear the input queue and wake up worker threads. */
 	tt_pthread_mutex_lock(&scheduler->mutex);
-	struct vy_task *task, *next;
-	stailq_foreach_entry_safe(task, next, &scheduler->input_queue, link) {
-		if (task->ops->abort)
-			task->ops->abort(task);
-		vy_task_delete(&scheduler->task_pool, task);
-	}
-	stailq_create(&scheduler->input_queue);
+	stailq_concat(&task_queue, &scheduler->input_queue);
 	pthread_cond_broadcast(&scheduler->worker_cond);
 	tt_pthread_mutex_unlock(&scheduler->mutex);
 
-	/* Join worker threads */
+	/* Wait for worker threads to exit. */
 	for (int i = 0; i < scheduler->worker_pool_size; i++)
 		cord_join(&scheduler->worker_pool[i]);
 	ev_async_stop(scheduler->loop, &scheduler->scheduler_async);
@@ -4636,12 +4633,14 @@ vy_scheduler_stop_workers(struct vy_scheduler *scheduler)
 	scheduler->worker_pool = NULL;
 	scheduler->worker_pool_size = 0;
 
-	/* Complete all processed tasks */
-	stailq_foreach_entry_safe(task, next, &scheduler->output_queue, link) {
-		vy_scheduler_complete_task(scheduler, task);
+	/* Abort all pending tasks. */
+	struct vy_task *task, *next;
+	stailq_concat(&task_queue, &scheduler->output_queue);
+	stailq_foreach_entry_safe(task, next, &task_queue, link) {
+		if (task->ops->abort != NULL)
+			task->ops->abort(task);
 		vy_task_delete(&scheduler->task_pool, task);
 	}
-	stailq_create(&scheduler->output_queue);
 }
 
 static void
