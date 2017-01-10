@@ -74,6 +74,7 @@
 
 #include "vy_stmt.h"
 #include "vy_quota.h"
+#include "vy_mem.h"
 
 #define HEAP_FORWARD_DECLARATION
 #include "salad/heap.h"
@@ -328,164 +329,6 @@ static struct vy_stmt *
 vy_apply_upsert(const struct vy_stmt *upsert, const struct vy_stmt *object,
 		const struct key_def *key_def,
 		const struct tuple_format *format, bool suppress_error);
-
-struct tree_mem_key {
-	const struct vy_stmt *stmt;
-	int64_t lsn;
-};
-
-struct vy_mem;
-
-static int
-vy_mem_tree_cmp(const struct vy_stmt *a, const struct vy_stmt *b,
-		struct vy_mem *index);
-
-static int
-vy_mem_tree_cmp_key(const struct vy_stmt *a, struct tree_mem_key *key,
-		    struct vy_mem *index);
-
-#define VY_MEM_TREE_EXTENT_SIZE (16 * 1024)
-
-#define BPS_TREE_NAME vy_mem_tree
-#define BPS_TREE_BLOCK_SIZE 512
-#define BPS_TREE_EXTENT_SIZE VY_MEM_TREE_EXTENT_SIZE
-#define BPS_TREE_COMPARE(a, b, index) vy_mem_tree_cmp(a, b, index)
-#define BPS_TREE_COMPARE_KEY(a, b, index) vy_mem_tree_cmp_key(a, b, index)
-#define bps_tree_elem_t const struct vy_stmt *
-#define bps_tree_key_t struct tree_mem_key *
-#define bps_tree_arg_t struct vy_mem *
-#define BPS_TREE_NO_DEBUG
-#define BPS_TREE_SOURCE 1
-
-#include "salad/bps_tree.h"
-
-/*
- * vy_mem is an in-memory container for vy_stmt objects in
- * a single vinyl range.
- * Internally it uses bps_tree to stores struct vy_stmt *objects.
- * which are ordered by statement key and, for the same key,
- * by lsn, in descending order.
- *
- * For example, assume there are two statements with the same key,
- * but different LSN. These are duplicates of the same key,
- * maintained for the purpose of MVCC/consistent read view.
- * In Vinyl terms, they form a duplicate chain.
- *
- * vy_mem distinguishes between the first duplicate in the chain
- * and other keys in that chain.
- *
- * During insertion, the reference counter of vy_stmt is
- * incremented, during destruction all vy_stmt' reference
- * counters are decremented.
- */
-struct vy_mem {
-	/** Link in range->frozen list. */
-	struct rlist in_frozen;
-	/** Link in scheduler->dirty_mems list. */
-	struct rlist in_dirty;
-	struct vy_mem_tree tree;
-	size_t used;
-	int64_t min_lsn;
-	/* A key definition for this index. */
-	struct key_def *key_def;
-	/* A tuple format for key_def. */
-	struct tuple_format *format;
-	/** version is initially 0 and is incremented on every write */
-	uint32_t version;
-	/** Allocator for extents */
-	struct lsregion *allocator;
-	/** The last LSN for lsregion allocator */
-	const int64_t *allocator_lsn;
-};
-
-static int
-vy_mem_tree_cmp(const struct vy_stmt *a, const struct vy_stmt *b,
-		struct vy_mem *index)
-{
-	int res = vy_stmt_compare(a, b, index->format, index->key_def);
-	res = res ? res : a->lsn > b->lsn ? -1 : a->lsn < b->lsn;
-	return res;
-}
-
-static int
-vy_mem_tree_cmp_key(const struct vy_stmt *a, struct tree_mem_key *key,
-		    struct vy_mem *index)
-{
-	int res = vy_stmt_compare(a, key->stmt, index->format, index->key_def);
-	if (res == 0) {
-		if (key->lsn == INT64_MAX - 1)
-			return 0;
-		res = a->lsn > key->lsn ? -1 : a->lsn < key->lsn;
-	}
-	return res;
-}
-
-static void *
-vy_mem_tree_extent_alloc(void *ctx);
-
-static void
-vy_mem_tree_extent_free(void *ctx, void *p)
-{
-	/* Can't free part of region allocated memory. */
-	(void)ctx;
-	(void)p;
-}
-
-static struct vy_mem *
-vy_mem_new(struct key_def *key_def, struct tuple_format *format,
-	   struct lsregion *allocator, const int64_t *allocator_lsn)
-{
-	struct vy_mem *index = malloc(sizeof(*index));
-	if (!index) {
-		diag_set(OutOfMemory, sizeof(*index),
-			 "malloc", "struct vy_mem");
-		return NULL;
-	}
-	index->min_lsn = INT64_MAX;
-	index->used = 0;
-	index->key_def = key_def;
-	index->version = 0;
-	index->format = format;
-	index->allocator = allocator;
-	index->allocator_lsn = allocator_lsn;
-	vy_mem_tree_create(&index->tree, index, vy_mem_tree_extent_alloc,
-			   vy_mem_tree_extent_free, index);
-	rlist_create(&index->in_frozen);
-	rlist_create(&index->in_dirty);
-	return index;
-}
-
-static void
-vy_mem_delete(struct vy_mem *index)
-{
-	assert(index == index->tree.arg);
-	TRASH(index);
-	free(index);
-}
-
-/*
- * Return the older statement for the given one.
- */
-static const struct vy_stmt *
-vy_mem_older_lsn(struct vy_mem *mem, const struct vy_stmt *stmt,
-		 const struct key_def *key_def)
-{
-	struct tree_mem_key tree_key;
-	tree_key.stmt = stmt;
-	tree_key.lsn = stmt->lsn - 1;
-	bool exact = false;
-	struct vy_mem_tree_iterator itr =
-		vy_mem_tree_lower_bound(&mem->tree, &tree_key, &exact);
-
-	if (vy_mem_tree_iterator_is_invalid(&itr))
-		return NULL;
-
-	const struct vy_stmt *result;
-	result = *vy_mem_tree_iterator_get_elem(&mem->tree, &itr);
-	if (vy_stmt_compare(result, stmt, mem->format, key_def) != 0)
-		return NULL;
-	return result;
-}
 
 /**
  * Run metadata. A run is a written to a file as a single
@@ -1183,19 +1026,6 @@ struct tx_manager {
 	int64_t vlsn;
 	struct vy_env *env;
 };
-
-static void *
-vy_mem_tree_extent_alloc(void *ctx)
-{
-	struct vy_mem *mem = (struct vy_mem *) ctx;
-	assert(mem->allocator != NULL && mem->allocator_lsn != NULL);
-	void *ret = lsregion_alloc(mem->allocator, VY_MEM_TREE_EXTENT_SIZE,
-				   *mem->allocator_lsn);
-	if (ret == NULL)
-		diag_set(OutOfMemory, VY_MEM_TREE_EXTENT_SIZE, "lsregion_alloc",
-			 "ret");
-	return ret;
-}
 
 /**
  * Abort all transaction which are reading the stmt v written by
