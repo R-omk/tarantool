@@ -1876,7 +1876,7 @@ check:
 	/*
 	 * When range split starts, the selected range is replaced with
 	 * several new ranges, each of which has ->shadow pointing to
-	 * the original range (see vy_task_compact_new()). New ranges
+	 * the original range (see vy_task_split_new()). New ranges
 	 * must not be read from until split has finished, because they
 	 * only contain in-memory data added after split was initiated,
 	 * while on-disk runs and older in-memory indexes are still
@@ -3449,7 +3449,7 @@ err_task:
 }
 
 static int
-vy_task_compact_execute(struct vy_task *task)
+vy_task_split_execute(struct vy_task *task)
 {
 	struct vy_range *range = task->range;
 	struct vy_write_iterator *wi = task->wi;
@@ -3479,7 +3479,7 @@ vy_task_compact_execute(struct vy_task *task)
 }
 
 static int
-vy_task_compact_complete(struct vy_task *task)
+vy_task_split_complete(struct vy_task *task)
 {
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
@@ -3507,7 +3507,7 @@ vy_task_compact_complete(struct vy_task *task)
 	if (vy_log_tx_commit(env->log) < 0)
 		return -1;
 
-	say_info("%s: completed compacting range %s",
+	say_info("%s: completed splitting range %s",
 		 index->name, vy_range_str(range));
 
 	vy_write_iterator_delete(task->wi);
@@ -3551,13 +3551,13 @@ skip_gc:
 }
 
 static void
-vy_task_compact_abort(struct vy_task *task)
+vy_task_split_abort(struct vy_task *task)
 {
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
 	struct vy_range *r, *tmp;
 
-	say_error("%s: failed to compact range %s",
+	say_error("%s: failed to split range %s",
 		  index->name, vy_range_str(range));
 
 	vy_write_iterator_delete(task->wi);
@@ -3597,24 +3597,24 @@ vy_task_compact_abort(struct vy_task *task)
 }
 
 static struct vy_task *
-vy_task_compact_new(struct mempool *pool, struct vy_range *range)
+vy_task_split_new(struct mempool *pool, struct vy_range *range,
+		  const char *split_key_raw)
 {
 	assert(rlist_empty(&range->split_list));
 
-	static struct vy_task_ops compact_ops = {
-		.execute = vy_task_compact_execute,
-		.complete = vy_task_compact_complete,
-		.abort = vy_task_compact_abort,
+	static struct vy_task_ops split_ops = {
+		.execute = vy_task_split_execute,
+		.complete = vy_task_split_complete,
+		.abort = vy_task_split_abort,
 	};
 
 	struct vy_index *index = range->index;
-	struct vy_stmt *split_key = NULL;
-	const char *split_key_raw;
+	struct vy_stmt *split_key;
 	struct vy_range *parts[2] = {NULL, };
 	struct vy_stmt *keys[3];
-	int n_parts = 1;
+	const int n_parts = 2;
 
-	struct vy_task *task = vy_task_new(pool, index, &compact_ops);
+	struct vy_task *task = vy_task_new(pool, index, &split_ops);
 	if (task == NULL)
 		goto err_task;
 
@@ -3642,17 +3642,12 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	}
 
 	/* Determine new ranges' boundaries. */
+	split_key = vy_key_from_msgpack(split_key_raw, index->key_def);
+	if (split_key == NULL)
+		goto err_split_key;
 	keys[0] = range->begin;
-	if (vy_range_needs_split(range, &split_key_raw)) {
-		split_key = vy_key_from_msgpack(split_key_raw,
-						     index->key_def);
-		if (split_key == NULL)
-			goto err_split_key;
-		n_parts = 2;
-		keys[1] = split_key;
-		keys[2] = range->end;
-	} else
-		keys[1] = range->end;
+	keys[1] = split_key;
+	keys[2] = range->end;
 
 	/* Allocate new ranges. */
 	for (int i = 0; i < n_parts; i++) {
@@ -3664,9 +3659,6 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		r->new_run = vy_run_new(++index->env->run_id_max);
 		if (r->new_run == NULL)
 			goto err_parts;
-		/* Account merge w/o split. */
-		if (n_parts == 1)
-			r->n_compactions = range->n_compactions + 1;
 	}
 
 	/*
@@ -3699,27 +3691,193 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 	task->range = range;
 	task->wi = wi;
 
-	if (split_key != NULL) {
-		say_info("%s: started splitting range %s by key %s",
-			 index->name, vy_range_str(range),
-			 vy_key_str(split_key_raw));
-	} else {
-		say_info("%s: started compacting range %s",
-			 index->name, vy_range_str(range));
-	}
+	say_info("%s: started splitting range %s by key %s",
+		 index->name, vy_range_str(range), vy_key_str(split_key_raw));
 	return task;
 err_parts:
 	for (int i = 0; i < n_parts; i++) {
 		if (parts[i] != NULL)
 			vy_range_delete(parts[i]);
 	}
-	if (split_key != NULL)
-		vy_stmt_unref(split_key);
+	vy_stmt_unref(split_key);
 err_split_key:
 	/* Sub iterators are deleted by vy_write_iterator_delete(). */
 err_wi_sub:
 	vy_write_iterator_delete(wi);
 err_wi:
+	vy_task_delete(pool, task);
+err_task:
+	return NULL;
+}
+
+static int
+vy_task_compact_execute(struct vy_task *task)
+{
+	struct vy_range *range = task->range;
+	struct vy_write_iterator *wi = task->wi;
+	struct vy_stmt *stmt;
+
+	/* The range has been deleted from the scheduler queues. */
+	assert(range->in_dump.pos == UINT32_MAX);
+	assert(range->in_compact.pos == UINT32_MAX);
+
+	/* Start iteration. */
+	if (vy_write_iterator_next(wi, &stmt) != 0)
+		return -1;
+	if (vy_range_write_run(range, wi, &stmt, &task->dump_size) != 0)
+		return -1;
+	return 0;
+}
+
+static int
+vy_task_compact_complete(struct vy_task *task)
+{
+	struct vy_index *index = task->index;
+	struct vy_env *env = index->env;
+	struct vy_range *range = task->range;
+	struct vy_mem *mem;
+	struct vy_run *run;
+
+	/*
+	 * Log change in metadata.
+	 */
+	vy_log_tx_begin(env->log);
+	rlist_foreach_entry(run, &range->runs, in_range) {
+		if (vy_log_delete_run(env->log, run->id) < 0) {
+			vy_log_tx_rollback(env->log);
+			return -1;
+		}
+	}
+	if (vy_log_insert_run(index->env->log, range->id,
+			      range->new_run->id) < 0) {
+		vy_log_tx_rollback(env->log);
+		return -1;
+	}
+	if (vy_log_tx_commit(env->log) < 0)
+		return -1;
+
+	say_info("%s: completed compacting range %s",
+		 index->name, vy_range_str(range));
+
+	vy_write_iterator_delete(task->wi);
+
+	/*
+	 * Replace compacted mems and runs with the resulting run.
+	 */
+	vy_index_unacct_range(index, range);
+	while (!rlist_empty(&range->runs)) {
+		run = rlist_shift_entry(&range->runs,
+					struct vy_run, in_range);
+		vy_run_unref(run);
+	}
+	while (!rlist_empty(&range->frozen)) {
+		mem = rlist_shift_entry(&range->frozen,
+					struct vy_mem, in_frozen);
+		vy_range_delete_mem(range, mem);
+	}
+	range->used = range->mem->used;
+	range->min_lsn = range->mem->min_lsn;
+	rlist_add_entry(&range->runs, range->new_run, in_range);
+	range->new_run = NULL;
+	range->run_count = 1;
+	range->n_compactions++;
+	range->version++;
+	vy_index_acct_range(index, range);
+
+	vy_scheduler_add_range(env->scheduler, range);
+	return 0;
+}
+
+static void
+vy_task_compact_abort(struct vy_task *task)
+{
+	struct vy_index *index = task->index;
+	struct vy_range *range = task->range;
+
+	say_error("%s: failed to compact range %s",
+		  index->name, vy_range_str(range));
+
+	vy_write_iterator_delete(task->wi);
+
+	/* Delete the run we failed to write. */
+	vy_run_delete(range->new_run);
+	range->new_run = NULL;
+
+	/*
+	 * No need to roll back anything if we failed to write a run.
+	 * The range will carry on with a new shadow in-memory index.
+	 */
+	vy_scheduler_add_range(index->env->scheduler, range);
+}
+
+static struct vy_task *
+vy_task_compact_new(struct mempool *pool, struct vy_range *range)
+{
+	/* Consider splitting the range if it's too big. */
+	const char *split_key;
+	if (vy_range_needs_split(range, &split_key))
+		return vy_task_split_new(pool, range, split_key);
+
+	static struct vy_task_ops compact_ops = {
+		.execute = vy_task_compact_execute,
+		.complete = vy_task_compact_complete,
+		.abort = vy_task_compact_abort,
+	};
+
+	struct vy_index *index = range->index;
+	struct vy_mem *mem;
+	struct vy_run *run;
+
+	struct vy_task *task = vy_task_new(pool, index, &compact_ops);
+	if (task == NULL)
+		goto err_task;
+	/*
+	 * We create a new in-memory tree, while we dump older trees.
+	 * This way we don't need to bother about synchronization.
+	 * If the newest mem is empty, we don't need to dump it and
+	 * therefore can omit creating a new mem.
+	 */
+	if (range->mem->used > 0) {
+		mem = vy_mem_new(index->env, index->key_def, index->format);
+		if (mem == NULL)
+			goto err_mem;
+		vy_range_freeze_mem(range);
+		range->mem = mem;
+		range->version++;
+	}
+	struct vy_write_iterator *wi;
+	wi = vy_write_iterator_new(index, true,
+				   tx_manager_vlsn(index->env->xm));
+	if (wi == NULL)
+		goto err_wi;
+
+	/* Prepare to merge mems and runs */
+	rlist_foreach_entry(mem, &range->frozen, in_frozen) {
+		if (vy_write_iterator_add_mem(wi, mem) != 0)
+			goto err_wi_sub;
+	}
+	rlist_foreach_entry(run, &range->runs, in_range) {
+		if (vy_write_iterator_add_run(wi, range, run) != 0)
+			goto err_wi_sub;
+	}
+
+	range->new_run = vy_run_new(++index->env->run_id_max);
+	if (range->new_run == NULL)
+		goto err_run;
+
+	task->range = range;
+	task->wi = wi;
+
+	say_info("%s: started compacting range %s",
+		 index->name, vy_range_str(range));
+	return task;
+err_run:
+	/* Sub iterators are deleted by vy_write_iterator_delete(). */
+err_wi_sub:
+	vy_write_iterator_delete(wi);
+err_wi:
+	/* Leave the new mem on the list in case of failure. */
+err_mem:
 	vy_task_delete(pool, task);
 err_task:
 	return NULL;
