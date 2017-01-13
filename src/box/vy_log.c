@@ -704,7 +704,7 @@ vy_recovery_hash_range(struct vy_recovery *recovery,
 		       int64_t index_id, int64_t range_id,
 		       const char *begin, const char *end)
 {
-	if (vy_recovery_lookup_range(recovery, index_id) != NULL) {
+	if (vy_recovery_lookup_range(recovery, range_id) != NULL) {
 		diag_set(ClientError, ER_VINYL, "duplicate range id");
 		return -1;
 	}
