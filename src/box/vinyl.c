@@ -2817,6 +2817,19 @@ vy_range_needs_split(struct vy_range *range, const char **p_split_key)
 }
 
 /**
+ * Return the oldest run to compact.
+ *
+ * The compaction task will compact all runs starting from the
+ * newest one and ending with the run returned by this function.
+ */
+static struct vy_run *
+vy_range_get_compact_run(struct vy_range *range)
+{
+	assert(!rlist_empty(&range->runs));
+	return rlist_last_entry(&range->runs, struct vy_run, in_range);
+}
+
+/**
  * Create an index directory for a new index.
  * TODO: create index files only after the WAL
  * record is committed.
@@ -3267,6 +3280,8 @@ struct vy_task {
 	size_t dump_size;
 	/** Range to dump or compact. */
 	struct vy_range *range;
+	/** For compaction task, the oldest run to compact. */
+	struct vy_run *compact_run;
 	/** Write iterator producing statements for the new run. */
 	struct vy_write_iterator *wi;
 	/**
@@ -3765,21 +3780,25 @@ vy_task_compact_complete(struct vy_task *task)
 	 * Replace compacted mems and runs with the resulting run.
 	 */
 	vy_index_unacct_range(index, range);
-	while (!rlist_empty(&range->runs)) {
+	do {
+		assert(!rlist_empty(&range->runs));
 		run = rlist_shift_entry(&range->runs,
 					struct vy_run, in_range);
 		vy_run_unref(run);
-	}
+		range->run_count--;
+	} while (run != task->compact_run);
+
 	while (!rlist_empty(&range->frozen)) {
 		mem = rlist_shift_entry(&range->frozen,
 					struct vy_mem, in_frozen);
 		vy_range_delete_mem(range, mem);
 	}
+
 	range->used = range->mem->used;
 	range->min_lsn = range->mem->min_lsn;
 	rlist_add_entry(&range->runs, range->new_run, in_range);
 	range->new_run = NULL;
-	range->run_count = 1;
+	range->run_count++;
 	range->n_compactions++;
 	range->version++;
 	vy_index_acct_range(index, range);
@@ -3856,9 +3875,12 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		if (vy_write_iterator_add_mem(wi, mem) != 0)
 			goto err_wi_sub;
 	}
+	struct vy_run *compact_run = vy_range_get_compact_run(range);
 	rlist_foreach_entry(run, &range->runs, in_range) {
 		if (vy_write_iterator_add_run(wi, range, run) != 0)
 			goto err_wi_sub;
+		if (run == compact_run)
+			break;
 	}
 
 	range->new_run = vy_run_new(++index->env->run_id_max);
@@ -3866,6 +3888,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range)
 		goto err_run;
 
 	task->range = range;
+	task->compact_run = compact_run;
 	task->wi = wi;
 
 	say_info("%s: started compacting range %s",
