@@ -1548,6 +1548,29 @@ vy_run_snprint_path(char *buf, size_t size, const char *dir,
 			dir, (long long)run_id, vy_file_suffix[type]);
 }
 
+/**
+ * Given the id of a run, delete its files.
+ *
+ * Note, in order not to stall the tx thread, this function uses
+ * coeio to unlink files and hence may yield. Also, this means
+ * that it cannot be used on shutdown, because the event loop is
+ * unavailable at that time.
+ */
+static void
+vy_run_unlink_files(const char *dir, int64_t run_id)
+{
+	char path[PATH_MAX];
+	for (int type = 0; type < vy_file_MAX; type++) {
+		vy_run_snprint_path(path, PATH_MAX, dir, run_id, type);
+		ERROR_INJECT(ERRINJ_VY_GC,
+			     {say_error("file '%s' was not deleted "
+					"due to error injection", path);
+			      continue;});
+		if (coeio_unlink(path) < 0 && errno != ENOENT)
+			say_syserror("failed to delete file '%s'", path);
+	}
+}
+
 static void
 vy_index_acct_run(struct vy_index *index, struct vy_run *run)
 {
@@ -3262,8 +3285,11 @@ struct vy_task_ops {
 	 * This function is called by the scheduler if either ->execute
 	 * or ->complete failed. It may be used to undo changes done to
 	 * the index when preparing the task.
+	 *
+	 * If @in_shutdown is set, the callback is invoked from the
+	 * engine destructor.
 	 */
-	void (*abort)(struct vy_task *);
+	void (*abort)(struct vy_task *, bool in_shutdown);
 };
 
 struct vy_task {
@@ -3380,7 +3406,7 @@ vy_task_dump_complete(struct vy_task *task)
 }
 
 static void
-vy_task_dump_abort(struct vy_task *task)
+vy_task_dump_abort(struct vy_task *task, bool in_shutdown)
 {
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
@@ -3391,6 +3417,8 @@ vy_task_dump_abort(struct vy_task *task)
 	vy_write_iterator_delete(task->wi);
 
 	/* Delete the run we failed to write. */
+	if (!in_shutdown)
+		vy_run_unlink_files(index->path, range->new_run->id);
 	vy_run_delete(range->new_run);
 	range->new_run = NULL;
 
@@ -3547,26 +3575,18 @@ vy_task_split_complete(struct vy_task *task)
 		vy_index_acct_range(index, r);
 		vy_scheduler_add_range(env->scheduler, r);
 	}
+	index->version++;
 
 	/* Delete files left from the old range. */
-	ERROR_INJECT(ERRINJ_VY_GC, goto skip_gc);
-	rlist_foreach_entry(run, &range->runs, in_range) {
-		char path[PATH_MAX];
-		for (int type = 0; type < vy_file_MAX; type++) {
-			vy_run_snprint_path(path, PATH_MAX, index->path,
-					    run->id, type);
-			if (coeio_unlink(path) < 0)
-				say_syserror("failed to delete file '%s'", path);
-		}
-	}
-skip_gc:
+	rlist_foreach_entry(run, &range->runs, in_range)
+		vy_run_unlink_files(index->path, run->id);
+
 	vy_range_delete(range);
-	index->version++;
 	return 0;
 }
 
 static void
-vy_task_split_abort(struct vy_task *task)
+vy_task_split_abort(struct vy_task *task, bool in_shutdown)
 {
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
@@ -3576,6 +3596,12 @@ vy_task_split_abort(struct vy_task *task)
 		  index->name, vy_range_str(range));
 
 	vy_write_iterator_delete(task->wi);
+
+	if (!in_shutdown) {
+		/* Delete files we failed to write, if any. */
+		rlist_foreach_entry(r, &range->split_list, split_list)
+			vy_run_unlink_files(index->path, r->new_run->id);
+	}
 
 	/*
 	 * On split failure we delete new ranges, but leave their
@@ -3751,7 +3777,7 @@ vy_task_compact_complete(struct vy_task *task)
 	struct vy_env *env = index->env;
 	struct vy_range *range = task->range;
 	struct vy_mem *mem;
-	struct vy_run *run;
+	struct vy_run *run, *tmp;
 
 	/*
 	 * Log change in metadata.
@@ -3780,11 +3806,12 @@ vy_task_compact_complete(struct vy_task *task)
 	 * Replace compacted mems and runs with the resulting run.
 	 */
 	vy_index_unacct_range(index, range);
+	RLIST_HEAD(compacted_runs);
 	do {
 		assert(!rlist_empty(&range->runs));
 		run = rlist_shift_entry(&range->runs,
 					struct vy_run, in_range);
-		vy_run_unref(run);
+		rlist_add_entry(&compacted_runs, run, in_range);
 		range->run_count--;
 	} while (run != task->compact_run);
 
@@ -3802,13 +3829,18 @@ vy_task_compact_complete(struct vy_task *task)
 	range->n_compactions++;
 	range->version++;
 	vy_index_acct_range(index, range);
-
 	vy_scheduler_add_range(env->scheduler, range);
+
+	/* Delete compacted runs and their files. */
+	rlist_foreach_entry_safe(run, &compacted_runs, in_range, tmp) {
+		vy_run_unlink_files(index->path, run->id);
+		vy_run_unref(run);
+	}
 	return 0;
 }
 
 static void
-vy_task_compact_abort(struct vy_task *task)
+vy_task_compact_abort(struct vy_task *task, bool in_shutdown)
 {
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
@@ -3819,6 +3851,8 @@ vy_task_compact_abort(struct vy_task *task)
 	vy_write_iterator_delete(task->wi);
 
 	/* Delete the run we failed to write. */
+	if (!in_shutdown)
+		vy_run_unlink_files(index->path, range->new_run->id);
 	vy_run_delete(range->new_run);
 	range->new_run = NULL;
 
@@ -4238,7 +4272,7 @@ vy_scheduler_complete_task(struct vy_scheduler *scheduler, struct vy_task *task)
 fail:
 	error_log(diag_last_error(&scheduler->diag));
 	if (task->ops->abort)
-		task->ops->abort(task);
+		task->ops->abort(task, false);
 	return -1;
 }
 
@@ -4439,7 +4473,7 @@ vy_scheduler_stop_workers(struct vy_scheduler *scheduler)
 	stailq_concat(&task_queue, &scheduler->output_queue);
 	stailq_foreach_entry_safe(task, next, &task_queue, link) {
 		if (task->ops->abort != NULL)
-			task->ops->abort(task);
+			task->ops->abort(task, true);
 		vy_task_delete(&scheduler->task_pool, task);
 	}
 }
