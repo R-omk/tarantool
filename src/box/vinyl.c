@@ -880,6 +880,10 @@ struct vy_tx {
 	 */
 	write_set_t write_set;
 	/**
+	 * Approximate size of memory needed to commit the write set.
+	 */
+	size_t write_size;
+	/**
 	 * Version of write_set state; if the state changes (insert/remove),
 	 * the version increments.
 	 */
@@ -1394,6 +1398,7 @@ vy_tx_begin(struct tx_manager *m, struct vy_tx *tx, enum tx_type type)
 {
 	stailq_create(&tx->log);
 	write_set_new(&tx->write_set);
+	tx->write_size = 0;
 	tx->write_set_version = 0;
 	tx->start = ev_now(loop());
 	tx->manager = m;
@@ -6468,6 +6473,8 @@ vy_insert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 void
 vy_rollback(struct vy_env *e, struct vy_tx *tx)
 {
+	/* Release quota reservation (see vy_prepare()) */
+	vy_quota_release(&e->quota, tx->write_size);
 	vy_tx_rollback(e, tx);
 	TRASH(tx);
 	free(tx);
@@ -6480,6 +6487,19 @@ vy_prepare(struct vy_env *e, struct vy_tx *tx)
 	assert(tx->state == VINYL_TX_READY);
 	int rc = 0;
 
+	/*
+	 * Estimate the amount of memory necessary to commit
+	 * the transaction and reserve quota accordingly.
+	 *
+	 * TODO: take into account BPS tree extents.
+	 */
+	struct txv *v;
+	for (v = write_set_first(&tx->write_set); v != NULL;
+	     v = write_set_next(&tx->write_set, v))
+		tx->write_size += tuple_size(v->stmt);
+
+	vy_quota_use(&e->quota, tx->write_size);
+
 	/* proceed read-only transactions */
 	if (!vy_tx_is_ro(tx) && tx->is_aborted) {
 		tx->state = VINYL_TX_ROLLBACK;
@@ -6489,8 +6509,8 @@ vy_prepare(struct vy_env *e, struct vy_tx *tx)
 	} else {
 		tx->state = VINYL_TX_COMMIT;
 		/** Abort read/write intersection */
-		struct txv *v = write_set_first(&tx->write_set);
-		for (; v != NULL; v = write_set_next(&tx->write_set, v))
+		for (v = write_set_first(&tx->write_set); v != NULL;
+		     v = write_set_next(&tx->write_set, v))
 			txv_abort_all(e, tx, v);
 	}
 
@@ -6514,7 +6534,6 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 		e->xm->lsn = lsn;
 
 	struct txv *v, *tmp;
-	struct vy_quota *quota = &e->quota;
 	struct lsregion *allocator = &e->allocator;
 	size_t mem_used_before = lsregion_used(allocator);
 	/*
@@ -6540,10 +6559,17 @@ vy_commit(struct vy_env *e, struct vy_tx *tx, int64_t lsn)
 	size_t write_size = mem_used_after - mem_used_before;
 	vy_stat_tx(e->stat, tx->start, count, write_count, write_size);
 
+	/*
+	 * Fix quota in case we over/under-estimated the amount of
+	 * memory this transaction used up (see vy_prepare()).
+	 */
+	if (tx->write_size > write_size)
+		vy_quota_release(&e->quota, tx->write_size - write_size);
+	if (tx->write_size < write_size)
+		vy_quota_force_use(&e->quota, write_size - tx->write_size);
+
 	TRASH(tx);
 	free(tx);
-
-	vy_quota_use(quota, write_size);
 	return 0;
 }
 
