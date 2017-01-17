@@ -157,19 +157,43 @@ static const char *lua_modules[] = {
 static int
 lbox_tonumber64(struct lua_State *L)
 {
-	if (lua_gettop(L) != 1)
-		luaL_error(L, "tonumber64: wrong number of arguments");
+	luaL_checkany(L, 1);
+	int base = luaL_optint(L, 2, -1);
 
 	switch (lua_type(L, 1)) {
 	case LUA_TNUMBER:
 		return 1;
 	case LUA_TSTRING:
 	{
-		const char *arg = luaL_checkstring(L, 1);
-		char *arge;
+		size_t argl = 0;
+		const char *arg = luaL_checklstring(L, 1, &argl);
+		/* Trim whitespaces at begin/end */
+		while (isspace(arg[argl-1])) {
+			argl--;
+		}
+		while (isspace(*arg)) {
+			arg++; argl--;
+		}
+		/* Check if we're parsing custom format */
+		if (arg[0] == '0' && argl > 2) {
+			if ((arg[1] == 'x' || arg[1] == 'X') &&
+			    (base == 16 || base == -1)) {
+				base = 16;
+				arg += 2; argl -= 2;
+			} else if ((arg[1] == 'b' || arg[1] == 'B') &&
+			           (base == 2 || base == -1)) {
+				base = 2;
+				arg += 2; argl -= 2;
+			}
+		} else {
+			base = 10;
+		}
+		luaL_argcheck(L, 2 <= base && base <= 36, 2, "base out of range");
+
 		errno = 0;
-		unsigned long long result = strtoull(arg, &arge, 10);
-		if (errno == 0 && arge != arg) {
+		char *arge;
+		unsigned long long result = strtoull(arg, &arge, base);
+		if (errno == 0 && arge == arg + argl) {
 			luaL_pushuint64(L, result);
 			return 1;
 		}
