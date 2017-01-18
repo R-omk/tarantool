@@ -325,6 +325,7 @@ struct space_opts {
 	 * - changes are not part of a snapshot
 	 */
 	bool temporary;
+	bool suppress_return_tuple;
 };
 
 extern const struct space_opts space_opts_default;

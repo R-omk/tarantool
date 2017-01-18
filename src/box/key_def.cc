@@ -454,10 +454,12 @@ key_validate_parts(struct key_def *key_def, const char *key,
 
 const struct space_opts space_opts_default = {
 	/* .temporary = */ false,
+	/* .suppress_return_tuple = */ false,
 };
 
 const struct opt_def space_opts_reg[] = {
 	OPT_DEF("temporary", MP_BOOL, struct space_opts, temporary),
+	OPT_DEF("suppress_return_tuple", MP_BOOL, struct space_opts, suppress_return_tuple),
 	{ NULL, MP_NIL, 0, 0 }
 };
 

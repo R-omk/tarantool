@@ -166,6 +166,11 @@ process_rw(struct request *request, struct space *space, struct tuple **result)
 		default:
 			tuple = NULL;
 		}
+                
+                if (space->def.opts.suppress_return_tuple){
+                        tuple = NULL;
+                }
+                
 		/*
 		 * Pin the tuple locally before the commit,
 		 * otherwise it may go away during yield in
